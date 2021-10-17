@@ -89,6 +89,19 @@ int main(int argc, char** argv) {
     char buf[512];
     int buf_len;
 
+
+    struct timeval tv;
+    struct fd_set original_set,workingset;
+    FD_ZERO(&original_set);
+    FD_SET(svr.listen_fd,&original_set);
+    tv.tv_sec = 0;
+    tv.tv_usec = 1000;
+    int MAXFD = svr.listen_fd;
+    
+
+
+    
+
     // Initialize server
     init_server((unsigned short) atoi(argv[1]));
 
@@ -97,29 +110,66 @@ int main(int argc, char** argv) {
 
     while (1) {
         // TODO: Add IO multiplexing
-        
-        // Check new connection
-        clilen = sizeof(cliaddr);
-        conn_fd = accept(svr.listen_fd, (struct sockaddr*)&cliaddr, (socklen_t*)&clilen);
-        if (conn_fd < 0) {
-            if (errno == EINTR || errno == EAGAIN) continue;  // try again
-            if (errno == ENFILE) {
-                (void) fprintf(stderr, "out of file descriptor table ... (maxconn %d)\n", maxfd);
-                continue;
+        memcpy(&workingset,&original_set,sizeof(original_set));
+        if(select(MAXFD+1,&workingset,NULL,NULL,&tv) == -1)
+        {
+            perror("select");
+            exit(1);
+        }
+        /*如果不用select "accept為slow syscall process may be blocked eternally, so we use select to make sure the reading data  is ready*/
+       for(int i = 0;i<MAXFD+1;i++)
+       {
+            if(FD_ISSET(i,&workingset))
+            {
+
+                if(i == svr.listen_fd)
+                {    
+                    clilen = sizeof(cliaddr);
+                    conn_fd = accept(svr.listen_fd, (struct sockaddr*)&cliaddr, (socklen_t*)&clilen);
+                    if (conn_fd < 0) {
+                        if (errno == EINTR || errno == EAGAIN) continue;  // try again
+                        if (errno == ENFILE) 
+                        {
+                            (void) fprintf(stderr, "out of file descriptor table ... (maxconn %d)\n", maxfd);
+                            continue;
+                        }
+                        ERR_EXIT("accept");
+                    }
+                    else
+                    {
+                        FD_SET(conn_fd,&original_set);
+                        if(conn_fd > MAXFD)
+                            MAXFD = conn_fd;
+                        // Check new connection
+                        requestP[conn_fd].conn_fd = conn_fd;
+                        strcpy(requestP[conn_fd].host, inet_ntoa(cliaddr.sin_addr));
+                        fprintf(stderr, "getting a new request... fd %d from %s\n", conn_fd, requestP[conn_fd].host);
+
+                    }
+                }
+                else // data from existing connection not establishing new connection, receive it
+                {
+                    #ifdef READ_SERVER
+                            fprintf(stderr, "%s", requestP[conn_fd].buf);
+                            sprintf(buf,"%s : %s",accept_read_header,requestP[conn_fd].buf);
+                            write(requestP[conn_fd].conn_fd, buf, strlen(buf));  
+                             
+                    #elif defined WRITE_SERVER
+                            fprintf(stderr, "%s", requestP[conn_fd].buf);
+                            sprintf(buf,"%s : %s",accept_write_header,requestP[conn_fd].buf);
+                            write(requestP[conn_fd].conn_fd, buf, strlen(buf)); 
+                    #endif 
+
+                }
             }
-            ERR_EXIT("accept");
-        }
-        requestP[conn_fd].conn_fd = conn_fd;
-        strcpy(requestP[conn_fd].host, inet_ntoa(cliaddr.sin_addr));
-        fprintf(stderr, "getting a new request... fd %d from %s\n", conn_fd, requestP[conn_fd].host);
+       }
 
-        int ret = handle_read(&requestP[conn_fd]); // parse data from client to requestP[conn_fd].buf
-        fprintf(stderr, "ret = %d\n", ret);
-	    if (ret < 0) {
-            fprintf(stderr, "bad request from %s\n", requestP[conn_fd].host);
-            continue;
-        }
 
+
+        
+
+        
+       
     // TODO: handle requests from clients
 #ifdef READ_SERVER      
         fprintf(stderr, "%s", requestP[conn_fd].buf);
