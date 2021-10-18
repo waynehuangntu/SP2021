@@ -8,8 +8,14 @@
 #include <netinet/in.h>
 #include <arpa/inet.h>
 #include <netdb.h>
+#include <sys/select.h>
+#include <sys/time.h>
+#include <sys/types.h>
+#include <stdbool.h>
+
 
 #define ERR_EXIT(a) do { perror(a); exit(1); } while(0)
+#define GET_VARIABLE_NAME(Variable) (#Variable)
 
 typedef struct {
     char hostname[512];  // server's hostname
@@ -88,49 +94,50 @@ int main(int argc, char** argv) {
     int file_fd;  // fd for file that we open for reading
     char buf[512];
     int buf_len;
+    struct flock lock;
+    bool write_lock = false;
+    bool read_lock = false;
 
 
-    struct timeval tv;
-    struct fd_set original_set,workingset;
-    FD_ZERO(&original_set);
-    FD_SET(svr.listen_fd,&original_set);
-
-    
-
-    
-
-
-    
+    file_fd = open("registerRecord",O_RDWR);
+    if(file_fd < 0)
+    {
+        fprintf(stderr,"no registerRecord file exist\n");
+    }
 
     // Initialize server
     init_server((unsigned short) atoi(argv[1]));
     printf("the fd is %d\n",svr.listen_fd);
 
+
     // Loop for handling connections
     fprintf(stderr, "\nstarting on %.80s, port %d, fd %d, maxconn %d...\n", svr.hostname, svr.port, svr.listen_fd, maxfd);
 
+    struct timeval tv;
+    fd_set original_set,workingset;
+    FD_ZERO(&original_set);
+    FD_SET(svr.listen_fd,&original_set);
+    fcntl(svr.listen_fd,F_SETFL,O_NONBLOCK);
     while (1) 
     {
         // TODO: Add IO multiplexing
-        tv.tv_sec = 5;
+        tv.tv_sec = 10;
         tv.tv_usec = 0;
         //memcpy(&workingset,&original_set,sizeof(original_set));
         workingset = original_set;
         int ret = select(maxfd,&workingset,NULL,NULL,&tv); 
         if(ret< 0)
         {
+            fprintf(stderr,"select error \n");
             perror("select");
             exit(1);
         }
         if (ret == 0)
         {
-            printf("select() timeout \n");
             continue;
             //break;
         }
-        printf("the ret value from select = %d\n",ret);
-
-
+       
         /*如果不用select "accept為slow syscall process may be blocked eternally, so we use select to make sure the reading data  is ready*/
        for(int i = 0;i<maxfd;i++)
        {
@@ -158,30 +165,86 @@ int main(int argc, char** argv) {
                         requestP[conn_fd].conn_fd = conn_fd;
                         strcpy(requestP[conn_fd].host, inet_ntoa(cliaddr.sin_addr));
                         fprintf(stderr, "getting a new request... fd %d from %s\n", conn_fd, requestP[conn_fd].host);
-
+                        char* entry_buf = "Please enter your id (to check your preference order):";
+                        write(conn_fd,entry_buf,strlen(entry_buf));
                     }
                 }
 
                 else // data from existing connection not establishing new connection, receive it
                 {
-                    printf("  Descriptor %d is readable\n", i);
+                    
                     int ret = handle_read(&requestP[conn_fd]); // parse data from client to requestP[conn_fd].buf
-                    fprintf(stderr, "ret = %d\n", ret);
 	                if (ret < 0) {
                         fprintf(stderr, "bad request from %s\n", requestP[conn_fd].host);
                         continue;
                     }
+                    int input_id = atoi(requestP[conn_fd].buf);
+                    
+
+                    if(input_id > 902020 || input_id < 902001){
+                        sprintf(buf,"Invalid ID, please try it again.\n");
+                        write(requestP[conn_fd].conn_fd,buf,strlen(buf));
+                        continue;
+                    }
+                    requestP[conn_fd].conn_fd = atoi(requestP[conn_fd].buf);
                 
 
-#ifdef READ_SERVER
-                            
+#ifdef READ_SERVER  
+                    
+                    registerRecord record;
+                    
+                    //set file lock to "the whole file"
+                    lock.l_type = F_RDLCK;
+                    lock.l_whence = SEEK_SET;
+                    lock.l_start = 0;
+                    lock.l_len = 0;
+                    
+                    if(fcntl(file_fd,F_SETLK,&lock) != -1 && write_lock != true) // file is not locked
+                    {
+                        read_lock = true;
+                        lseek(file_fd,sizeof(registerRecord) * (input_id - 902001) ,SEEK_SET);
+                        read(file_fd,&record,sizeof(registerRecord));//將data寫進來
+                        sprintf(buf,"Your preference order is ");
+                        
+                        for(int i = 1 ;i<=3;i++)
+                        {
+                            if(record.AZ == i)
+                                sprintf(buf+strlen(buf),"AZ");
+                            else if(record.BNT == i)
+                                sprintf(buf+strlen(buf),"BNT");
+                            else
+                                sprintf(buf+strlen(buf),"Moderna");
+                            if(i != 3)
+                                sprintf(buf+strlen(buf)," > ");
+                        }
+                        sprintf(buf+strlen(buf),".\n");
+                        write(requestP[conn_fd].conn_fd,buf,strlen(buf));
+                    }
+                    
+                    else{ // the file is locked
+                        sprintf(buf,"Locked.\n");
+                        write(requestP[conn_fd].conn_fd,buf,strlen(buf));
+                    }
+
+                    //unlock the file
+                    lock.l_type = F_UNLCK;
+                    fcntl(file_fd,F_SETLK,&file_fd);
+                    read_lock = false;
+                    
+
+
+
+                    
                     fprintf(stderr, "%s", requestP[conn_fd].buf);
                     sprintf(buf,"%s : %s",accept_read_header,requestP[conn_fd].buf);
-                    //do something to deal with client buffer including typo checking
-                    write(requestP[conn_fd].conn_fd, buf, strlen(buf));  
+                    fprintf(stderr,"the buffer content is %s \n",buf);
+                    write(requestP[conn_fd].conn_fd, buf, strlen(buf));// write message to client  
 
 #elif defined WRITE_SERVER
-                    fprintf(stderr,"Please enter your id (to check your preference order):");
+                    
+                    registerRecord record;
+                    
+
                     fprintf(stderr, "%s", requestP[conn_fd].buf);
                     sprintf(buf,"%s : %s",accept_write_header,requestP[conn_fd].buf);
                     write(requestP[conn_fd].conn_fd, buf, strlen(buf));                
