@@ -94,9 +94,9 @@ int main(int argc, char** argv) {
     struct fd_set original_set,workingset;
     FD_ZERO(&original_set);
     FD_SET(svr.listen_fd,&original_set);
-    tv.tv_sec = 0;
-    tv.tv_usec = 1000;
-    int MAXFD = svr.listen_fd;
+
+    
+
     
 
 
@@ -104,28 +104,43 @@ int main(int argc, char** argv) {
 
     // Initialize server
     init_server((unsigned short) atoi(argv[1]));
+    printf("the fd is %d\n",svr.listen_fd);
 
     // Loop for handling connections
     fprintf(stderr, "\nstarting on %.80s, port %d, fd %d, maxconn %d...\n", svr.hostname, svr.port, svr.listen_fd, maxfd);
 
-    while (1) {
+    while (1) 
+    {
         // TODO: Add IO multiplexing
-        memcpy(&workingset,&original_set,sizeof(original_set));
-        if(select(MAXFD+1,&workingset,NULL,NULL,&tv) == -1)
+        tv.tv_sec = 5;
+        tv.tv_usec = 0;
+        //memcpy(&workingset,&original_set,sizeof(original_set));
+        workingset = original_set;
+        int ret = select(maxfd,&workingset,NULL,NULL,&tv); 
+        if(ret< 0)
         {
             perror("select");
             exit(1);
         }
+        if (ret == 0)
+        {
+            printf("select() timeout \n");
+            continue;
+            //break;
+        }
+        printf("the ret value from select = %d\n",ret);
+
+
         /*如果不用select "accept為slow syscall process may be blocked eternally, so we use select to make sure the reading data  is ready*/
-       for(int i = 0;i<MAXFD+1;i++)
+       for(int i = 0;i<maxfd;i++)
        {
             if(FD_ISSET(i,&workingset))
             {
-
                 if(i == svr.listen_fd)
                 {    
+                    printf("Listening socket is readable\n");
                     clilen = sizeof(cliaddr);
-                    conn_fd = accept(svr.listen_fd, (struct sockaddr*)&cliaddr, (socklen_t*)&clilen);
+                    conn_fd = accept(svr.listen_fd, (struct sockaddr*)&cliaddr, (socklen_t*)&clilen);//new connection established
                     if (conn_fd < 0) {
                         if (errno == EINTR || errno == EAGAIN) continue;  // try again
                         if (errno == ENFILE) 
@@ -135,11 +150,10 @@ int main(int argc, char** argv) {
                         }
                         ERR_EXIT("accept");
                     }
-                    else
+                    else // accept succeed
                     {
+                        printf("New connection incoming%d\n",conn_fd);
                         FD_SET(conn_fd,&original_set);
-                        if(conn_fd > MAXFD)
-                            MAXFD = conn_fd;
                         // Check new connection
                         requestP[conn_fd].conn_fd = conn_fd;
                         strcpy(requestP[conn_fd].host, inet_ntoa(cliaddr.sin_addr));
@@ -147,42 +161,40 @@ int main(int argc, char** argv) {
 
                     }
                 }
+
                 else // data from existing connection not establishing new connection, receive it
                 {
-                    #ifdef READ_SERVER
-                            fprintf(stderr, "%s", requestP[conn_fd].buf);
-                            sprintf(buf,"%s : %s",accept_read_header,requestP[conn_fd].buf);
-                            write(requestP[conn_fd].conn_fd, buf, strlen(buf));  
-                             
-                    #elif defined WRITE_SERVER
-                            fprintf(stderr, "%s", requestP[conn_fd].buf);
-                            sprintf(buf,"%s : %s",accept_write_header,requestP[conn_fd].buf);
-                            write(requestP[conn_fd].conn_fd, buf, strlen(buf)); 
-                    #endif 
+                    printf("  Descriptor %d is readable\n", i);
+                    int ret = handle_read(&requestP[conn_fd]); // parse data from client to requestP[conn_fd].buf
+                    fprintf(stderr, "ret = %d\n", ret);
+	                if (ret < 0) {
+                        fprintf(stderr, "bad request from %s\n", requestP[conn_fd].host);
+                        continue;
+                    }
+                
+
+#ifdef READ_SERVER
+                            
+                    fprintf(stderr, "%s", requestP[conn_fd].buf);
+                    sprintf(buf,"%s : %s",accept_read_header,requestP[conn_fd].buf);
+                    //do something to deal with client buffer including typo checking
+                    write(requestP[conn_fd].conn_fd, buf, strlen(buf));  
+
+#elif defined WRITE_SERVER
+                    fprintf(stderr,"Please enter your id (to check your preference order):");
+                    fprintf(stderr, "%s", requestP[conn_fd].buf);
+                    sprintf(buf,"%s : %s",accept_write_header,requestP[conn_fd].buf);
+                    write(requestP[conn_fd].conn_fd, buf, strlen(buf));                
+#endif 
+
+                    close(requestP[conn_fd].conn_fd);
+                    free_request(&requestP[conn_fd]);
+                    
 
                 }
             }
        }
-
-
-
         
-
-        
-       
-    // TODO: handle requests from clients
-#ifdef READ_SERVER      
-        fprintf(stderr, "%s", requestP[conn_fd].buf);
-        sprintf(buf,"%s : %s",accept_read_header,requestP[conn_fd].buf);
-        write(requestP[conn_fd].conn_fd, buf, strlen(buf));    
-#elif defined WRITE_SERVER
-        fprintf(stderr, "%s", requestP[conn_fd].buf);
-        sprintf(buf,"%s : %s",accept_write_header,requestP[conn_fd].buf);
-        write(requestP[conn_fd].conn_fd, buf, strlen(buf));    
-#endif
-
-        close(requestP[conn_fd].conn_fd);
-        free_request(&requestP[conn_fd]);
     }
     free(requestP);
     return 0;
