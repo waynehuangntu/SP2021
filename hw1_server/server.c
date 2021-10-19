@@ -12,6 +12,7 @@
 #include <sys/time.h>
 #include <sys/types.h>
 #include <stdbool.h>
+#include <string.h>
 
 
 #define ERR_EXIT(a) do { perror(a); exit(1); } while(0)
@@ -30,7 +31,8 @@ typedef struct {
     size_t buf_len;  // bytes used by buf
     // you don't need to change this.
     int id;
-    int wait_for_write;  // used by handle_read to know if the header is read or not.
+    bool wait_for_write;  // used by handle_read to know if the header is read or not.
+    bool verified_id;
 } request;
 
 server svr;  // server
@@ -94,7 +96,7 @@ int main(int argc, char** argv) {
     int file_fd;  // fd for file that we open for reading
     char buf[512];
     int buf_len;
-    struct flock lock;
+    struct flock lock,w_lock;
     bool write_lock = false;
     bool read_lock = false;
 
@@ -118,6 +120,7 @@ int main(int argc, char** argv) {
     FD_ZERO(&original_set);
     FD_SET(svr.listen_fd,&original_set);
     fcntl(svr.listen_fd,F_SETFL,O_NONBLOCK);
+    int max_fd = svr.listen_fd;
     while (1) 
     {
         // TODO: Add IO multiplexing
@@ -125,7 +128,7 @@ int main(int argc, char** argv) {
         tv.tv_usec = 0;
         //memcpy(&workingset,&original_set,sizeof(original_set));
         workingset = original_set;
-        int ret = select(maxfd,&workingset,NULL,NULL,&tv); 
+        int ret = select(max_fd+1,&workingset,NULL,NULL,&tv); 
         if(ret< 0)
         {
             fprintf(stderr,"select error \n");
@@ -139,7 +142,7 @@ int main(int argc, char** argv) {
         }
        
         /*如果不用select "accept為slow syscall process may be blocked eternally, so we use select to make sure the reading data  is ready*/
-       for(int i = 0;i<maxfd;i++)
+       for(int i = 0;i<max_fd+1;i++)
        {
             if(FD_ISSET(i,&workingset))
             {
@@ -162,7 +165,10 @@ int main(int argc, char** argv) {
                         printf("New connection incoming%d\n",conn_fd);
                         FD_SET(conn_fd,&original_set);
                         // Check new connection
+                        if(conn_fd > max_fd)
+                            max_fd = conn_fd;
                         requestP[conn_fd].conn_fd = conn_fd;
+                        requestP[conn_fd].verified_id = false;
                         strcpy(requestP[conn_fd].host, inet_ntoa(cliaddr.sin_addr));
                         fprintf(stderr, "getting a new request... fd %d from %s\n", conn_fd, requestP[conn_fd].host);
                         char* entry_buf = "Please enter your id (to check your preference order):";
@@ -173,85 +179,169 @@ int main(int argc, char** argv) {
                 else // data from existing connection not establishing new connection, receive it
                 {
                     
-                    int ret = handle_read(&requestP[conn_fd]); // parse data from client to requestP[conn_fd].buf
+                    fprintf(stderr,"data from existing connecetion %d.\n",i);
+                    int ret = handle_read(&requestP[i]); // parse data from client to requestP[conn_fd].buf
 	                if (ret < 0) {
                         fprintf(stderr, "bad request from %s\n", requestP[conn_fd].host);
                         continue;
                     }
-                    int input_id = atoi(requestP[conn_fd].buf);
-                    
+                    if(requestP[i].verified_id == false){
 
-                    if(input_id > 902020 || input_id < 902001){
-                        sprintf(buf,"Invalid ID, please try it again.\n");
-                        write(requestP[conn_fd].conn_fd,buf,strlen(buf));
-                        continue;
+                        int input_id = atoi(requestP[i].buf);
+            
+                        if(input_id > 902020 || input_id < 902001){
+                            sprintf(buf,"Invalid ID, please try it again.\n");
+                            write(requestP[i].conn_fd,buf,strlen(buf));
+                            continue;
+                        }
+
+                        char *reply = "Valid ID.\n";
+                        write(requestP[i].conn_fd,reply,strlen(reply));
+                        requestP[i].id = input_id;
+
+                        registerRecord record_r; // register record for reading
+                        
+                        
+                        //set file lock to "the whole file"
+                        lock.l_type = F_RDLCK;
+                        lock.l_whence = SEEK_SET;
+                        lock.l_start = 0;
+                        lock.l_len = 0;
+                        
+                        if(fcntl(file_fd,F_SETLK,&lock) != -1 && write_lock != true) // file is not locked
+                        {
+                            read_lock = true;
+                            lseek(file_fd,sizeof(registerRecord) * (input_id - 902001) ,SEEK_SET);
+                            read(file_fd,&record_r,sizeof(registerRecord));//將data寫進來
+                            sprintf(buf,"Your preference order is ");
+                            
+                            for(int i = 1 ;i<=3;i++)
+                            {
+                                if(record_r.AZ == i)
+                                    sprintf(buf+strlen(buf),"AZ");
+                                else if(record_r.BNT == i)
+                                    sprintf(buf+strlen(buf),"BNT");
+                                else
+                                    sprintf(buf+strlen(buf),"Moderna");
+                                if(i != 3)
+                                    sprintf(buf+strlen(buf)," > ");
+                            }
+                            sprintf(buf+strlen(buf),".\n");
+                            write(requestP[i].conn_fd,buf,strlen(buf));
+                        }
+                        
+                        else{ // the file is locked
+                            sprintf(buf,"Locked.\n");
+                            write(requestP[i].conn_fd,buf,strlen(buf));
+                        }
+
+                        //unlock the file
+                        lock.l_type = F_UNLCK;
+                        fcntl(file_fd,F_SETLK,&lock);
+                        read_lock = false;
                     }
-                    requestP[conn_fd].conn_fd = atoi(requestP[conn_fd].buf);
                 
 
 #ifdef READ_SERVER  
                     
-                    registerRecord record;
-                    
-                    //set file lock to "the whole file"
-                    lock.l_type = F_RDLCK;
-                    lock.l_whence = SEEK_SET;
-                    lock.l_start = 0;
-                    lock.l_len = 0;
-                    
-                    if(fcntl(file_fd,F_SETLK,&lock) != -1 && write_lock != true) // file is not locked
-                    {
-                        read_lock = true;
-                        lseek(file_fd,sizeof(registerRecord) * (input_id - 902001) ,SEEK_SET);
-                        read(file_fd,&record,sizeof(registerRecord));//將data寫進來
-                        sprintf(buf,"Your preference order is ");
-                        
-                        for(int i = 1 ;i<=3;i++)
-                        {
-                            if(record.AZ == i)
-                                sprintf(buf+strlen(buf),"AZ");
-                            else if(record.BNT == i)
-                                sprintf(buf+strlen(buf),"BNT");
-                            else
-                                sprintf(buf+strlen(buf),"Moderna");
-                            if(i != 3)
-                                sprintf(buf+strlen(buf)," > ");
-                        }
-                        sprintf(buf+strlen(buf),".\n");
-                        write(requestP[conn_fd].conn_fd,buf,strlen(buf));
-                    }
-                    
-                    else{ // the file is locked
-                        sprintf(buf,"Locked.\n");
-                        write(requestP[conn_fd].conn_fd,buf,strlen(buf));
-                    }
-
-                    //unlock the file
-                    lock.l_type = F_UNLCK;
-                    fcntl(file_fd,F_SETLK,&file_fd);
-                    read_lock = false;
-                    
-
-
-
-                    
-                    fprintf(stderr, "%s", requestP[conn_fd].buf);
-                    sprintf(buf,"%s : %s",accept_read_header,requestP[conn_fd].buf);
-                    fprintf(stderr,"the buffer content is %s \n",buf);
-                    write(requestP[conn_fd].conn_fd, buf, strlen(buf));// write message to client  
+                    fprintf(stderr,"the socket %d connection is closed and FD_CLR executed\n",requestP[i].conn_fd);
+                    FD_CLR(requestP[i].conn_fd,&original_set);
+                    close(requestP[i].conn_fd);
+                    free_request(&requestP[i]);
 
 #elif defined WRITE_SERVER
                     
-                    registerRecord record;
+                    
+                    char* modecheck_W  = "IN WRITE MODE.\n";
+                    if(requestP[i].verified_id == false){
+                        //char* modecheck_W  = "IN WRITE MODE.\n";
+                        char* write_reply = "Please input your preference order respectively(AZ,BNT,Moderna):";
+                        requestP[i].verified_id = true;
+                        requestP[i].wait_for_write = true;
+                        write(requestP[i].conn_fd,modecheck_W,strlen(modecheck_W));
+                        write(requestP[i].conn_fd,write_reply,strlen(write_reply));
+                        continue;
+                    }
+                    else{
+                        registerRecord record_w;
+                        //lock the whole file
+                        char* str = requestP[i].buf;
+                        char order[3];
+                        char* pch;
+                        int index = 0;
+                        fprintf(stderr,"the buffer input is %s \n",str);
+                        pch = strtok (str," ");
+                        while (pch != NULL)
+                        {
+                            order[index] = *pch;
+                            pch = strtok (NULL, " ");
+                            index++;
+                        }
+
+                        
+
+
+                        w_lock.l_type = F_WRLCK;
+                        w_lock.l_whence = SEEK_SET;
+                        w_lock.l_start = 0;
+                        w_lock.l_len = 0;
+
+                        if(fcntl(file_fd,F_SETLK,&w_lock) != -1 && write_lock !=true){
+                            write_lock = true;
+                            lseek(file_fd,sizeof(registerRecord)*(requestP[i].id-902001),SEEK_SET);
+                            record_w.id = requestP[i].id;
+                            record_w.AZ = order[0] - '0';
+                            record_w.BNT = order[1] - '0';
+                            record_w.Moderna = order[2] - '0';
+                            
+                            write(file_fd,&record_w,sizeof(registerRecord));
+                            char reply_buffer[512] = "Preference order for 902001 modified successed, new preference order is ";
+                            for(int i = 1 ;i<=3;i++)
+                            {
+                                if(record_w.AZ == i)
+                                    sprintf(reply_buffer+strlen(reply_buffer),"AZ");
+                                else if(record_w.BNT == i)
+                                    sprintf(reply_buffer+strlen(reply_buffer),"BNT");
+                                else
+                                    sprintf(reply_buffer+strlen(reply_buffer),"Moderna");
+                                if(i != 3)
+                                    sprintf(reply_buffer+strlen(reply_buffer)," > ");
+                            }
+                            sprintf(reply_buffer+strlen(reply_buffer),".");
+                            write(requestP[i].conn_fd,reply_buffer,strlen(reply_buffer));
+
+                        }
+                        else{
+                            char* lock_buf = "Locked.";
+                            write(requestP[i].conn_fd,lock_buf,strlen(lock_buf));
+
+                        }
+                        w_lock.l_type = F_UNLCK;
+                        fcntl(file_fd,F_SETLK,&w_lock);
+                        write_lock = false;
+
                     
 
-                    fprintf(stderr, "%s", requestP[conn_fd].buf);
-                    sprintf(buf,"%s : %s",accept_write_header,requestP[conn_fd].buf);
-                    write(requestP[conn_fd].conn_fd, buf, strlen(buf));                
+
+                    }
+
+
+
+                    fprintf(stderr,"the socket %d connection is closed and FD_CLR executed\n",requestP[i].conn_fd);
+                    FD_CLR(requestP[i].conn_fd,&original_set);
+                    close(requestP[i].conn_fd);
+                    free_request(&requestP[i]);
+
+                    //fprintf(stderr, "%s", requestP[conn_fd].buf);
+                    //sprintf(buf,"%s : %s",accept_write_header,requestP[conn_fd].buf);
+                    //write(requestP[conn_fd].conn_fd, buf, strlen(buf));                
 #endif 
 
-                    close(requestP[conn_fd].conn_fd);
-                    free_request(&requestP[conn_fd]);
+                    
+                    //close(requestP[conn_fd].conn_fd);
+                    //free_request(&requestP[conn_fd]);
+                    //FD_CLR(requestP[i].conn_fd,&original_set);
+                    //fprintf(stderr,"the socket %d connection is closed and FD_CLR executed\n",requestP[i].conn_fd);
                     
 
                 }
